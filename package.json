@@ -1,0 +1,16 @@
+{
+  "name": "tmpshare-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild web/src/app.js --bundle --format=esm --minify --legal-comments=none --target=es2020 --outfile=web/vendor/app.js"
+  },
+  "dependencies": {
+    "htm": "^3.1.1",
+    "preact": "^10.29.1",
+    "tus-js-client": "^4.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0"
+  }
+}
