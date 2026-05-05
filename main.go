@@ -19,7 +19,19 @@ import (
 
 	"github.com/tus/tusd/v2/pkg/filestore"
 	tushandler "github.com/tus/tusd/v2/pkg/handler"
+	"golang.org/x/text/unicode/norm"
 )
+
+// Noms de périphériques Windows réservés — préfixés d'un "_" si rencontrés,
+// pour qu'un téléchargement via wget --content-disposition n'échoue pas côté Windows.
+var windowsDeviceFiles = func() map[string]bool {
+	m := map[string]bool{"CON": true, "PRN": true, "AUX": true, "NUL": true}
+	for i := 0; i < 10; i++ {
+		m[fmt.Sprintf("COM%d", i)] = true
+		m[fmt.Sprintf("LPT%d", i)] = true
+	}
+	return m
+}()
 
 //go:embed web
 var webFS embed.FS
@@ -755,22 +767,44 @@ func validKey(s string) bool {
 	return true
 }
 
+// sanitizeName porte werkzeug.utils.secure_filename : NFKD + strip non-ASCII,
+// remplace les séparateurs de chemin par des espaces, condense les espaces en "_",
+// ne garde que [A-Za-z0-9_.-], strip "._" en bord, préfixe les noms de devices Windows.
+// Élimine ainsi tout caractère shell-actif ($ ` ; | & < > etc.) et tout path traversal.
 func sanitizeName(s string) string {
-	s = strings.TrimSpace(s)
-	s = filepath.Base(s)
-	if s == "." || s == "/" || s == ".." || s == "" {
-		return ""
+	s = norm.NFKD.String(s)
+
+	var ascii strings.Builder
+	for _, r := range s {
+		if r < 0x80 {
+			ascii.WriteRune(r)
+		}
 	}
+	s = ascii.String()
+
+	s = strings.ReplaceAll(s, "/", " ")
+	s = strings.ReplaceAll(s, "\\", " ")
+	s = strings.Join(strings.Fields(s), "_")
+
 	var b strings.Builder
 	for _, r := range s {
 		switch {
-		case r == '/' || r == '\\' || r == 0:
-		case r < 0x20:
-		default:
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '.' || r == '_' || r == '-':
 			b.WriteRune(r)
 		}
 	}
-	return b.String()
+	s = strings.Trim(b.String(), "._")
+	if s == "" {
+		return ""
+	}
+	base, _, _ := strings.Cut(s, ".")
+	if windowsDeviceFiles[strings.ToUpper(base)] {
+		s = "_" + s
+	}
+	return s
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
