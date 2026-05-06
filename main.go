@@ -263,6 +263,11 @@ func serveTLS(mux http.Handler, listen string) {
 		}
 	}()
 
+	// Pré-charge les certificats au démarrage pour éviter qu'un premier visiteur
+	// déclenche l'émission ACME et tombe sur un handshake long ou en échec.
+	// Le listener plain HTTP doit déjà tourner (ACME HTTP-01 a besoin de :80).
+	go warmAutocert(m, tlsDomains)
+
 	if http3Enabled {
 		h3 := &http3.Server{
 			Addr:      tlsListen,
@@ -294,6 +299,24 @@ func redirectToTLSHandler(port string) http.Handler {
 		target += r.URL.RequestURI()
 		http.Redirect(w, r, target, http.StatusPermanentRedirect)
 	})
+}
+
+// warmAutocert force l'émission/chargement des certificats au démarrage pour
+// chaque domaine listé, plutôt que d'attendre le premier handshake TLS d'un
+// visiteur. Échoue silencieusement (logs only) — un domaine non joignable au
+// boot ne doit pas bloquer le service.
+func warmAutocert(m *autocert.Manager, domains []string) {
+	for _, d := range domains {
+		hello := &tls.ClientHelloInfo{
+			ServerName:      d,
+			SupportedProtos: []string{"h2", "http/1.1"},
+		}
+		if _, err := m.GetCertificate(hello); err != nil {
+			log.Printf("autocert warm %s: %v", d, err)
+			continue
+		}
+		log.Printf("autocert: certificat prêt pour %s", d)
+	}
 }
 
 // withAltSvc annonce HTTP/3 via l'entête Alt-Svc — les navigateurs
