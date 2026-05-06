@@ -22,12 +22,11 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"github.com/tus/tusd/v2/pkg/filestore"
 	tushandler "github.com/tus/tusd/v2/pkg/handler"
+	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/text/unicode/norm"
 )
 
-// Noms de périphériques Windows réservés — préfixés d'un "_" si rencontrés,
-// pour qu'un téléchargement via wget --content-disposition n'échoue pas côté Windows.
 var windowsDeviceFiles = func() map[string]bool {
 	m := map[string]bool{"CON": true, "PRN": true, "AUX": true, "NUL": true}
 	for i := 0; i < 10; i++ {
@@ -54,8 +53,8 @@ type uploadResponse struct {
 	Key       string    `json:"key"`
 	Name      string    `json:"name"`
 	Size      int64     `json:"size"`
-	URL       string    `json:"url"`       // courte : {base}/{key}
-	URLNamed  string    `json:"url_named"` // {base}/{key}/{name}, marche avec wget par défaut
+	URL       string    `json:"url"`
+	URLNamed  string    `json:"url_named"`
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
@@ -74,7 +73,6 @@ var (
 	tlsACMEEmail    string
 	http3Enabled    bool
 
-	// Injecté au build via -ldflags "-X main.buildVersion=...".
 	buildVersion = "dev"
 
 	mu sync.Mutex
@@ -87,7 +85,6 @@ func envOr(key, def string) string {
 	return def
 }
 
-// authed enrobe un handler avec checkAuth ; renvoie 401 si refusé.
 func authed(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !checkAuth(r) {
@@ -102,7 +99,6 @@ func authStatus(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// checkAuth — comparaison à temps constant.
 func checkAuth(r *http.Request) bool {
 	got := r.Header.Get("X-Auth-Token")
 	if got == "" {
@@ -139,7 +135,7 @@ func main() {
 	}
 	defaultExpires = d
 
-	maxUploadSize = 0 // 0 = illimité
+	maxUploadSize = 0
 	if v := os.Getenv("MAX_UPLOAD_SIZE"); v != "" {
 		if _, err := fmt.Sscanf(v, "%d", &maxUploadSize); err != nil {
 			log.Fatalf("MAX_UPLOAD_SIZE invalide: %v", err)
@@ -208,7 +204,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              listen,
-		Handler:           mux,
+		Handler:           accessLogger(mux, "http"),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 	log.Printf("tmpshare en écoute sur %s — data=%s base=%s default-expires=%s",
@@ -216,16 +212,6 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
-// serveTLS lance le listener HTTPS direct (avec autocert + Let's Encrypt) sur
-// tlsListen, optionnellement HTTP/3 sur le même endpoint UDP, et un listener
-// plain HTTP sur listen qui répond aux ACME HTTP-01 et redirige tout le reste
-// en 308 vers https://host:tlsRedirectPort/...
-//
-// L'idée : le reverse proxy fronte le port public 443 (avec ses propres certs)
-// et forwarde vers ce listener plain. Ce listener émet alors un redirect
-// permanent vers le port direct (ex. 444) où ce service gère ses propres certs
-// via Let's Encrypt et expose HTTP/2 + HTTP/3 — éliminant le mixed content
-// causé par le proxying.
 func serveTLS(mux http.Handler, listen string) {
 	m := &autocert.Manager{
 		Cache:      autocert.DirCache(tlsCacheDir),
@@ -233,45 +219,50 @@ func serveTLS(mux http.Handler, listen string) {
 		HostPolicy: autocert.HostWhitelist(tlsDomains...),
 		Email:      tlsACMEEmail,
 	}
+	if dir := os.Getenv("TLS_ACME_DIRECTORY_URL"); dir != "" {
+		m.Client = &acme.Client{DirectoryURL: dir}
+		log.Printf("autocert: using ACME directory %s", dir)
+	}
 
 	tlsCfg := m.TLSConfig()
 	tlsCfg.MinVersion = tls.VersionTLS12
 	tlsCfg.NextProtos = append([]string{"h2", "http/1.1"}, tlsCfg.NextProtos...)
 
-	tlsHandler := mux
+	var tlsHandler http.Handler = mux
 	if http3Enabled && tlsRedirectPort != "" {
 		tlsHandler = withAltSvc(mux, tlsRedirectPort)
 	}
 
 	tlsSrv := &http.Server{
 		Addr:              tlsListen,
-		Handler:           tlsHandler,
+		Handler:           accessLogger(tlsHandler, "https"),
 		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
 	plainSrv := &http.Server{
 		Addr:              listen,
-		Handler:           m.HTTPHandler(redirectToTLSHandler(tlsRedirectPort)),
+		Handler:           accessLogger(m.HTTPHandler(redirectToTLSHandler(tlsRedirectPort)), "http"),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
+	plainLn, err := net.Listen("tcp", plainSrv.Addr)
+	if err != nil {
+		log.Fatalf("plain http listen %s: %v", plainSrv.Addr, err)
+	}
 	go func() {
 		log.Printf("tmpshare HTTP redirect→HTTPS (+ACME HTTP-01) sur %s", listen)
-		if err := plainSrv.ListenAndServe(); err != nil {
+		if err := plainSrv.Serve(plainLn); err != nil {
 			log.Fatalf("plain http: %v", err)
 		}
 	}()
 
-	// Pré-charge les certificats au démarrage pour éviter qu'un premier visiteur
-	// déclenche l'émission ACME et tombe sur un handshake long ou en échec.
-	// Le listener plain HTTP doit déjà tourner (ACME HTTP-01 a besoin de :80).
 	go warmAutocert(m, tlsDomains)
 
 	if http3Enabled {
 		h3 := &http3.Server{
 			Addr:      tlsListen,
-			Handler:   tlsHandler,
+			Handler:   accessLogger(tlsHandler, "h3"),
 			TLSConfig: http3.ConfigureTLSConfig(tlsCfg),
 		}
 		go func() {
@@ -301,10 +292,6 @@ func redirectToTLSHandler(port string) http.Handler {
 	})
 }
 
-// warmAutocert force l'émission/chargement des certificats au démarrage pour
-// chaque domaine listé, plutôt que d'attendre le premier handshake TLS d'un
-// visiteur. Échoue silencieusement (logs only) — un domaine non joignable au
-// boot ne doit pas bloquer le service.
 func warmAutocert(m *autocert.Manager, domains []string) {
 	for _, d := range domains {
 		hello := &tls.ClientHelloInfo{
@@ -315,12 +302,10 @@ func warmAutocert(m *autocert.Manager, domains []string) {
 			log.Printf("autocert warm %s: %v", d, err)
 			continue
 		}
-		log.Printf("autocert: certificat prêt pour %s", d)
+		log.Printf("autocert: certificate ready for %s", d)
 	}
 }
 
-// withAltSvc annonce HTTP/3 via l'entête Alt-Svc — les navigateurs
-// compatibles basculeront sur QUIC pour les requêtes suivantes.
 func withAltSvc(h http.Handler, port string) http.Handler {
 	altSvc := fmt.Sprintf(`h3=":%s"; ma=2592000`, port)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -329,8 +314,56 @@ func withAltSvc(h http.Handler, port string) http.Handler {
 	})
 }
 
+func accessLogger(h http.Handler, proto string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		lw := &logResponseWriter{ResponseWriter: w}
+		h.ServeHTTP(lw, r)
+		addr := r.RemoteAddr
+		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+			if i := strings.Index(fwd, ","); i >= 0 {
+				fwd = fwd[:i]
+			}
+			addr = strings.TrimSpace(fwd)
+		}
+		status := lw.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		log.Printf("%s %s %s %s %d %d %s",
+			addr, proto, r.Method, r.URL.RequestURI(),
+			status, lw.bytes, time.Since(start).Round(time.Microsecond))
+	})
+}
 
-// ----- routing racine -----
+type logResponseWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (w *logResponseWriter) WriteHeader(code int) {
+	if w.status == 0 {
+		w.status = code
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *logResponseWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(b)
+	w.bytes += int64(n)
+	return n, err
+}
+
+func (w *logResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 
 func root(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
@@ -342,7 +375,6 @@ func root(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(p, "/static/"):
 		serveStatic(w, r)
 	default:
-		// /{key} ou /{key}/{nom} (le nom est purement décoratif pour wget).
 		rest := strings.TrimPrefix(p, "/")
 		key, _, _ := strings.Cut(rest, "/")
 		if !validKey(key) {
@@ -394,8 +426,6 @@ func serveVendor(w http.ResponseWriter, r *http.Request) {
 	http.FileServer(http.FS(sub)).ServeHTTP(w, r)
 }
 
-// ----- upload PUT (body brut) -----
-
 func upload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut && r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -432,8 +462,6 @@ func upload(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
-
-// ----- upload POST multipart (legacy / petits fichiers) -----
 
 func uploadMultipart(w http.ResponseWriter, r *http.Request) {
 	if maxUploadSize > 0 {
@@ -477,8 +505,6 @@ func uploadMultipart(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// ----- TUS (resumable) -----
-
 func setupTus() (http.Handler, error) {
 	store := filestore.New(tusDir)
 	composer := tushandler.NewStoreComposer()
@@ -498,7 +524,6 @@ func setupTus() (http.Handler, error) {
 
 func authedTus(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Laisser passer le preflight OPTIONS — tusd répond aux entêtes CORS lui-même.
 		if r.Method != http.MethodOptions && !checkAuth(r) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -507,8 +532,6 @@ func authedTus(h http.Handler) http.Handler {
 	})
 }
 
-// finalizeTus est appelé synchrone par tusd avant la réponse 204 finale.
-// Il renomme le fichier tusd, écrit le meta.json et un mapping done_{id}.json.
 func finalizeTus(info tushandler.FileInfo) (tushandler.HTTPResponse, error) {
 	name := sanitizeName(info.MetaData["filename"])
 	if name == "" {
@@ -550,7 +573,6 @@ func finalizeTus(info tushandler.FileInfo) (tushandler.HTTPResponse, error) {
 		return tushandler.HTTPResponse{}, err
 	}
 
-	// mapping pour /finalize/{id}
 	mapPath := filepath.Join(tusDir, "done_"+info.ID+".json")
 	mapData, _ := json.Marshal(map[string]any{
 		"key":        key,
@@ -564,7 +586,6 @@ func finalizeTus(info tushandler.FileInfo) (tushandler.HTTPResponse, error) {
 		log.Printf("finalize: write mapping: %v", err)
 	}
 
-	// Headers de la réponse 204 finale (utiles pour clients qui les lisent).
 	return tushandler.HTTPResponse{
 		Header: tushandler.HTTPHeader{
 			"X-Tmpshare-Key": key,
@@ -573,7 +594,6 @@ func finalizeTus(info tushandler.FileInfo) (tushandler.HTTPResponse, error) {
 	}, nil
 }
 
-// /finalize/{tus-id} — récupère et consomme le mapping écrit par finalizeTus.
 func finalize(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/finalize/")
 	if id == "" || strings.ContainsAny(id, "/\\.") {
@@ -595,7 +615,6 @@ func finalize(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(b)
 }
 
-// ----- store commun (PUT et multipart) -----
 
 func store(name, contentType string, body io.Reader, expires time.Duration) (*uploadResponse, error) {
 	mu.Lock()
@@ -641,7 +660,6 @@ func store(name, contentType string, body io.Reader, expires time.Duration) (*up
 	}, nil
 }
 
-// ----- download -----
 
 func download(w http.ResponseWriter, r *http.Request, key string) {
 	m, err := readMeta(key)
@@ -663,8 +681,6 @@ func download(w http.ResponseWriter, r *http.Request, key string) {
 		return
 	}
 
-	// /{key} → redirect 302 vers /{key}/{nom} pour que wget/curl simples
-	// reconstruisent le bon nom à partir du dernier segment de l'URL.
 	expected := "/" + m.Key
 	if r.URL.Path == expected || r.URL.Path == expected+"/" {
 		http.Redirect(w, r, expected+"/"+urlEncode(m.Name), http.StatusFound)
@@ -685,13 +701,10 @@ func download(w http.ResponseWriter, r *http.Request, key string) {
 	}
 
 	w.Header().Set("Content-Type", m.ContentType)
-	// inline => le navigateur affiche si possible (image/vidéo/pdf), sinon télécharge.
-	// curl -OJ et wget --content-disposition utilisent le filename pour nommer.
 	w.Header().Set("Content-Disposition", contentDisposition("inline", m.Name))
 	http.ServeContent(w, r, m.Name, st.ModTime(), f)
 }
 
-// contentDisposition encode le filename selon RFC 5987 (UTF-8) + variante ASCII.
 func contentDisposition(disp, name string) string {
 	ascii := strings.Map(func(r rune) rune {
 		if r < 0x20 || r == '"' || r == '\\' || r > 0x7e {
@@ -720,7 +733,6 @@ func urlEncode(s string) string {
 	return b.String()
 }
 
-// ----- list / delete -----
 
 func list(w http.ResponseWriter, _ *http.Request) {
 	mu.Lock()
@@ -782,7 +794,6 @@ func apiDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "key": key})
 }
 
-// ----- janitor -----
 
 func janitor() {
 	t := time.NewTicker(time.Minute)
@@ -821,7 +832,6 @@ func sweep() {
 		}
 	}
 
-	// Nettoie aussi les mappings done_*.json non consommés > 1h
 	tusEntries, err := os.ReadDir(tusDir)
 	if err != nil {
 		return
@@ -861,7 +871,6 @@ func purgeUnlocked(key string) error {
 	return nil
 }
 
-// ----- meta I/O -----
 
 func writeMeta(key string, m meta) error {
 	b, err := json.MarshalIndent(m, "", "  ")
@@ -887,7 +896,6 @@ func readMetaUnlocked(key string) (meta, error) {
 	return m, err
 }
 
-// ----- utils -----
 
 func parseExpires(s string) (time.Duration, error) {
 	if s == "" {
@@ -908,7 +916,6 @@ func newKey() (string, error) {
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	// 6 octets → 10 chars base32 (sans padding) en minuscules.
 	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b)), nil
 }
 
@@ -924,10 +931,6 @@ func validKey(s string) bool {
 	return true
 }
 
-// sanitizeName porte werkzeug.utils.secure_filename : NFKD + strip non-ASCII,
-// remplace les séparateurs de chemin par des espaces, condense les espaces en "_",
-// ne garde que [A-Za-z0-9_.-], strip "._" en bord, préfixe les noms de devices Windows.
-// Élimine ainsi tout caractère shell-actif ($ ` ; | & < > etc.) et tout path traversal.
 func sanitizeName(s string) string {
 	s = norm.NFKD.String(s)
 
