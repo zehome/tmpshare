@@ -1,0 +1,17 @@
+services:
+  tmpshare:
+    image: tmpshare:latest
+    container_name: tmpshare
+    environment:
+      TLS_LISTEN: ":444"
+      TLS_DOMAINS: t.example.com
+      TLS_ACME_EMAIL: contact@example.com
+      BASE_URL: "https://t.example.com:444"
+      UPLOAD_TOKEN: "xxx"
+    ports:
+      - 444:444/tcp
+      - 444:444/udp
+      - 3880:8080
+    volumes:
+      - /nvme/tmpshare:/data
+    restart: unless-stopped
