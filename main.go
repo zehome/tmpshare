@@ -364,6 +364,10 @@ func (w *logResponseWriter) Flush() {
 	}
 }
 
+func (w *logResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 
 func root(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
