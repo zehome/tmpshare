@@ -25,10 +25,14 @@ ENV LISTEN=":8080" \
     DATA_DIR="/data" \
     BASE_URL="http://localhost:8080" \
     DEFAULT_EXPIRES="168h" \
-    MAX_UPLOAD_SIZE="0"
+    MAX_UPLOAD_SIZE="0" \
+    HTTP3="1"
 # UPLOAD_TOKEN doit être fourni au runtime (-e UPLOAD_TOKEN=...)
+# Pour activer le listener TLS direct + Let's Encrypt, fournir au runtime :
+#   TLS_LISTEN=":444" TLS_DOMAINS="exemple.com" TLS_ACME_EMAIL="…"
+# HTTP/3 (QUIC) est activé par défaut — il ne s'allume que si TLS_LISTEN est défini.
 
 VOLUME ["/data"]
-EXPOSE 8080
+EXPOSE 8080 444/tcp 444/udp
 
 ENTRYPOINT ["/tmpshare"]

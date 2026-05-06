@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"embed"
 	"encoding/base32"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,8 +19,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/quic-go/quic-go/http3"
 	"github.com/tus/tusd/v2/pkg/filestore"
 	tushandler "github.com/tus/tusd/v2/pkg/handler"
+	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -62,6 +66,13 @@ var (
 	defaultExpires time.Duration
 	maxUploadSize  int64
 	uploadToken    string
+
+	tlsListen       string
+	tlsDomains      []string
+	tlsCacheDir     string
+	tlsRedirectPort string
+	tlsACMEEmail    string
+	http3Enabled    bool
 
 	// Injecté au build via -ldflags "-X main.buildVersion=...".
 	buildVersion = "dev"
@@ -135,6 +146,27 @@ func main() {
 		}
 	}
 
+	tlsListen = os.Getenv("TLS_LISTEN")
+	if d := os.Getenv("TLS_DOMAINS"); d != "" {
+		for _, s := range strings.Split(d, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				tlsDomains = append(tlsDomains, s)
+			}
+		}
+	}
+	tlsCacheDir = envOr("TLS_CACHE_DIR", filepath.Join(dataDir, "autocert"))
+	tlsACMEEmail = os.Getenv("TLS_ACME_EMAIL")
+	tlsRedirectPort = os.Getenv("TLS_REDIRECT_PORT")
+	if tlsRedirectPort == "" && tlsListen != "" {
+		if _, p, err := net.SplitHostPort(tlsListen); err == nil {
+			tlsRedirectPort = p
+		}
+	}
+	switch strings.ToLower(os.Getenv("HTTP3")) {
+	case "1", "true", "yes", "on":
+		http3Enabled = true
+	}
+
 	if err := os.MkdirAll(tusDir, 0o755); err != nil {
 		log.Fatalf("création %s: %v", tusDir, err)
 	}
@@ -163,6 +195,17 @@ func main() {
 	mux.HandleFunc("/auth", authed(authStatus))
 	mux.Handle("/files/", http.StripPrefix("/files", authedTus(tusH)))
 
+	if tlsListen != "" {
+		if len(tlsDomains) == 0 {
+			log.Fatal("TLS_LISTEN défini mais TLS_DOMAINS manquant (liste de domaines autorisés pour autocert)")
+		}
+		if err := os.MkdirAll(tlsCacheDir, 0o700); err != nil {
+			log.Fatalf("création %s: %v", tlsCacheDir, err)
+		}
+		serveTLS(mux, listen)
+		return
+	}
+
 	srv := &http.Server{
 		Addr:              listen,
 		Handler:           mux,
@@ -172,6 +215,97 @@ func main() {
 		listen, dataDir, baseURL, defaultExpires)
 	log.Fatal(srv.ListenAndServe())
 }
+
+// serveTLS lance le listener HTTPS direct (avec autocert + Let's Encrypt) sur
+// tlsListen, optionnellement HTTP/3 sur le même endpoint UDP, et un listener
+// plain HTTP sur listen qui répond aux ACME HTTP-01 et redirige tout le reste
+// en 308 vers https://host:tlsRedirectPort/...
+//
+// L'idée : le reverse proxy fronte le port public 443 (avec ses propres certs)
+// et forwarde vers ce listener plain. Ce listener émet alors un redirect
+// permanent vers le port direct (ex. 444) où ce service gère ses propres certs
+// via Let's Encrypt et expose HTTP/2 + HTTP/3 — éliminant le mixed content
+// causé par le proxying.
+func serveTLS(mux http.Handler, listen string) {
+	m := &autocert.Manager{
+		Cache:      autocert.DirCache(tlsCacheDir),
+		Prompt:     autocert.AcceptTOS,
+		HostPolicy: autocert.HostWhitelist(tlsDomains...),
+		Email:      tlsACMEEmail,
+	}
+
+	tlsCfg := m.TLSConfig()
+	tlsCfg.MinVersion = tls.VersionTLS12
+	tlsCfg.NextProtos = append([]string{"h2", "http/1.1"}, tlsCfg.NextProtos...)
+
+	tlsHandler := mux
+	if http3Enabled && tlsRedirectPort != "" {
+		tlsHandler = withAltSvc(mux, tlsRedirectPort)
+	}
+
+	tlsSrv := &http.Server{
+		Addr:              tlsListen,
+		Handler:           tlsHandler,
+		TLSConfig:         tlsCfg,
+		ReadHeaderTimeout: 30 * time.Second,
+	}
+
+	plainSrv := &http.Server{
+		Addr:              listen,
+		Handler:           m.HTTPHandler(redirectToTLSHandler(tlsRedirectPort)),
+		ReadHeaderTimeout: 30 * time.Second,
+	}
+
+	go func() {
+		log.Printf("tmpshare HTTP redirect→HTTPS (+ACME HTTP-01) sur %s", listen)
+		if err := plainSrv.ListenAndServe(); err != nil {
+			log.Fatalf("plain http: %v", err)
+		}
+	}()
+
+	if http3Enabled {
+		h3 := &http3.Server{
+			Addr:      tlsListen,
+			Handler:   tlsHandler,
+			TLSConfig: http3.ConfigureTLSConfig(tlsCfg),
+		}
+		go func() {
+			log.Printf("tmpshare HTTP/3 (QUIC) sur %s/udp", tlsListen)
+			if err := h3.ListenAndServe(); err != nil {
+				log.Printf("http3: %v", err)
+			}
+		}()
+	}
+
+	log.Printf("tmpshare HTTPS sur %s — domaines=%v http3=%v", tlsListen, tlsDomains, http3Enabled)
+	log.Fatal(tlsSrv.ListenAndServeTLS("", ""))
+}
+
+func redirectToTLSHandler(port string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil && h != "" {
+			host = h
+		}
+		target := "https://" + host
+		if port != "" && port != "443" {
+			target += ":" + port
+		}
+		target += r.URL.RequestURI()
+		http.Redirect(w, r, target, http.StatusPermanentRedirect)
+	})
+}
+
+// withAltSvc annonce HTTP/3 via l'entête Alt-Svc — les navigateurs
+// compatibles basculeront sur QUIC pour les requêtes suivantes.
+func withAltSvc(h http.Handler, port string) http.Handler {
+	altSvc := fmt.Sprintf(`h3=":%s"; ma=2592000`, port)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Alt-Svc", altSvc)
+		h.ServeHTTP(w, r)
+	})
+}
+
 
 // ----- routing racine -----
 
